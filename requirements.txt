@@ -10,3 +10,4 @@ livekit-plugins-ai-coustics==0.2.7
 livekit-plugins-noise-cancellation==0.2.5
 python-dotenv
 livekit-plugins-turn-detector==1.5.1
+torch==2.11.0

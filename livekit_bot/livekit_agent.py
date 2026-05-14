@@ -25,9 +25,17 @@ import asyncio
 import json
 import base64
 import uuid
+from datetime import datetime, timezone
 
 TMP_DIR_BASE = "tmp_uploaded_images"
 os.makedirs(TMP_DIR_BASE, exist_ok=True)
+
+DOC_DIR_BASE = os.path.join("storage", "local", "incoming")
+os.makedirs(DOC_DIR_BASE, exist_ok=True)
+
+DOC_UPLOAD_TOPIC = "doc-upload"
+MAX_DOC_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+PDF_MAGIC = b"%PDF-"
 
 # ---------------------------------------------------------------------------
 # Session-isolation helpers
@@ -50,6 +58,40 @@ def _session_image_dir(room_name: str, participant_identity: str) -> str:
     safe_room = _sanitize_path_component(room_name)
     safe_participant = _sanitize_path_component(participant_identity)
     return os.path.join(TMP_DIR_BASE, safe_room, safe_participant)
+
+
+def _user_doc_base(participant_identity: str) -> str:
+    """Return the user-scoped base directory for all documents from this user."""
+    safe_user = _sanitize_path_component(participant_identity)
+    return os.path.join(DOC_DIR_BASE, safe_user)
+
+
+def _update_manifest(user_doc_base: str, user_id: str, entry: dict) -> None:
+    """Atomically update the user's manifest.json with a new or updated document entry."""
+    manifest_path = os.path.join(user_doc_base, "manifest.json")
+    tmp_path = manifest_path + ".tmp"
+
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    else:
+        manifest = {
+            "user_id": user_id,
+            "total_count": 0,
+            "last_updated": "",
+            "documents": [],
+        }
+
+    manifest["documents"] = [
+        d for d in manifest["documents"] if d["doc_id"] != entry["doc_id"]
+    ]
+    manifest["documents"].append(entry)
+    manifest["total_count"] = len(manifest["documents"])
+    manifest["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.rename(tmp_path, manifest_path)
 
 
 def _resolve_user_email(
@@ -129,11 +171,16 @@ class Assistant(Agent):
     def __init__(
         self,
         user_email: str,
+        session_id: str,
         session_image_dir: str,
+        user_doc_base: str,
         active_participant_identity: str,
     ) -> None:
         self.session_image_dir = session_image_dir
         os.makedirs(self.session_image_dir, exist_ok=True)
+        self.session_id = session_id
+        self.user_doc_base = user_doc_base
+        os.makedirs(self.user_doc_base, exist_ok=True)
         # Store the identity of the human participant this assistant instance
         # should serve.  Byte-stream uploads from other identities are ignored
         # to prevent cross-session image mixing.
@@ -274,6 +321,95 @@ class Assistant(Agent):
             return "webp"
         return None
 
+    async def _doc_received(self, reader, participant_identity: str):
+        if participant_identity != self.active_participant_identity:
+            print(
+                f"[DOC] Ignoring byte stream from {participant_identity!r} — "
+                f"expected {self.active_participant_identity!r} (cross-session guard)"
+            )
+            return
+
+        try:
+            chunks = []
+            total_bytes = 0
+            async for chunk in reader:
+                total_bytes += len(chunk)
+                if total_bytes > MAX_DOC_SIZE_BYTES:
+                    print(
+                        f"[DOC] Rejected: file exceeds {MAX_DOC_SIZE_BYTES // (1024 * 1024)} MB limit"
+                    )
+                    return
+                chunks.append(chunk)
+
+            if not chunks:
+                print("[DOC] Empty byte stream, ignoring")
+                return
+
+            doc_bytes = b"".join(chunks)
+
+            if not doc_bytes.startswith(PDF_MAGIC):
+                print(f"[DOC] Rejected: not a valid PDF (magic={doc_bytes[:8]!r})")
+                return
+
+            # Extract original filename from stream metadata if the client sent it
+            original_filename = "document.pdf"
+            try:
+                attrs = getattr(getattr(reader, "info", None), "attributes", None) or {}
+                original_filename = attrs.get("filename", original_filename)
+            except Exception:
+                pass
+
+            doc_id = uuid.uuid4().hex
+            stored_at = datetime.now(timezone.utc).isoformat()
+
+            doc_dir = os.path.join(self.user_doc_base, doc_id)
+            os.makedirs(doc_dir, exist_ok=True)
+
+            pdf_path = os.path.join(doc_dir, "original.pdf")
+            meta_path = os.path.join(doc_dir, "meta.json")
+
+            with open(pdf_path, "wb") as f:
+                f.write(doc_bytes)
+
+            meta = {
+                "doc_id": doc_id,
+                "user_id": participant_identity,
+                "session_id": self.session_id,
+                "original_filename": original_filename,
+                "size_bytes": total_bytes,
+                "stored_at": stored_at,
+                "doc_type": None,
+                "status": "received",
+                "local_path": pdf_path,
+                "blob_url": None,
+                "processing_error": None,
+            }
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+            _update_manifest(
+                self.user_doc_base,
+                participant_identity,
+                {
+                    "doc_id": doc_id,
+                    "original_filename": original_filename,
+                    "doc_type": None,
+                    "status": "received",
+                    "stored_at": stored_at,
+                },
+            )
+
+            print(
+                f"[DOC] Saved '{original_filename}' → {pdf_path} "
+                f"({total_bytes / 1024:.1f} KB)"
+            )
+
+        except Exception as e:
+            print(f"[DOC] Error handling document upload: {e}")
+            import traceback
+
+            traceback.print_exc()
+
 
 async def entrypoint(ctx: JobContext):
     print("Agent received job - Connecting to room...")
@@ -284,24 +420,9 @@ async def entrypoint(ctx: JobContext):
 
     room_name = ctx.room.name
     print(f"Successfully joined room: {room_name}")
-
-    # ---------------------------------------------------------------------------
-    # Resolve the owning user using session-isolation helpers.
-    #
-    # Rooms are named `voice-<emailTag>-<sessionId>` by the frontend, so we can
-    # cross-reference the room name against remote participant identities to find
-    # the exact human this agent instance should serve.
-    # ---------------------------------------------------------------------------
-    DEFAULT_EMAIL = "rohit.kaushal@xebia.com"
-    active_participant_identity = _resolve_user_email(
-        default_email=DEFAULT_EMAIL,
-        room_name=room_name,
-        remote_participants=ctx.room.remote_participants,
-    )
-    user = ctx.room.remote_participants
-    # user_email = user[0]
-    user_email = next(iter(user))
-    # active_participant_identity = next(iter(user))
+    participant = await ctx.wait_for_participant()
+    user_email = participant.identity
+    active_participant_identity = participant.identity
 
     print(f"[ENTRYPOINT] room={room_name}")
     print(f"[ENTRYPOINT] user_email={user_email}")
@@ -310,10 +431,13 @@ async def entrypoint(ctx: JobContext):
     # Image directory is scoped to (room, participant) — no two sessions ever
     # share the same path even on a single worker process.
     session_image_dir = _session_image_dir(room_name, active_participant_identity)
+    user_doc_base = _user_doc_base(active_participant_identity)
 
     assistant = Assistant(
         user_email=user_email,
+        session_id=room_name,
         session_image_dir=session_image_dir,
+        user_doc_base=user_doc_base,
         active_participant_identity=active_participant_identity,
     )
 
@@ -328,6 +452,18 @@ async def entrypoint(ctx: JobContext):
 
     ctx.room.register_byte_stream_handler("my-topic", _image_received_handler)
     print("[ENTRYPOINT] Registered byte stream handler for 'my-topic'")
+
+    def _doc_received_handler(reader, participant_identity):
+        task = asyncio.create_task(
+            assistant._doc_received(reader, participant_identity)
+        )
+        assistant._tasks.append(task)
+        task.add_done_callback(
+            lambda t: assistant._tasks.remove(t) if t in assistant._tasks else None
+        )
+
+    ctx.room.register_byte_stream_handler(DOC_UPLOAD_TOPIC, _doc_received_handler)
+    print(f"[ENTRYPOINT] Registered byte stream handler for '{DOC_UPLOAD_TOPIC}'")
 
     session = AgentSession(
         vad=silero.VAD.load(),
